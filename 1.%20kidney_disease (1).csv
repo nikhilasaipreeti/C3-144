@@ -1,0 +1,449 @@
+/*
+ * our code is developed for LAM Research Challenge 3.0 - Stage 2 using
+ * ESP32 controller: Case 1 (control + measurement) and Case 2 (flush + shutdown)
+
+///The main purpose of this code is to control three pumps and a solenoid valve, monitor the liquid flow and sump level, and display the system status on a SCADA dashboard.
+ *
+ * Board : ESP32 NodeMCU (ESP32-WROOM), Arduino core 2.x or 3.x
+ * Libs  : only the ESP32 core (WiFi, WebServer, Preferences). Nothing to install.
+ *
+ * GPIO map = LAM Stage 2 PCB Rev 1.0 (SOURCE CONFIRMED in 03_pcb_gpio_map.md). Not changed.
+ *
+ * Talks to scada/index.html two ways:
+ *   1) USB serial 115200 baud: one JSON status line every 200 ms; text commands in (see handleCommand)
+ *   2) HTTP:  GET /api/status   GET /api/cmd?c=<command>     (CORS open, for the browser)
+ *
+ * NOT HARDWARE VERIFIED (check on the bench before trusting):
+ *   - FT-01 output level on GPIO14 must be <= 3.3 V (see 03_pcb_gpio_map.md warning)
+ *   - Float switch polarity: this code treats FSW = LOW as "sump HIGH level"
+ *   - Calibration defaults below are the YF-S401 datasheet figure, NOT a calibration
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+///First, we include the libraries required for Wi-Fi communication, hosting the SCADA API, and saving calibration settings even after the controller restarts.
+
+// ---------------------------------------------------------------- user settings
+#define WIFI_STA_SSID   ""            // fill in to join your router; empty = start own AP
+#define WIFI_STA_PASS   ""
+#define WIFI_AP_SSID    "LAM-SCADA"   // fallback access point, SCADA URL http://192.168.4.1
+#define WIFI_AP_PASS    "lam12345"
+
+
+///There are two Wi-Fi modes here.
+- Station mode (STA): The ESP32 connects to an existing router.
+- Access point mode (AP): The ESP32 creates its own Wi-Fi network.
+
+// Case 2 pump decision. The challenge PDF says "all three pumps operate simultaneously".
+// The existing simulation holds P-01 OFF. This is an ENGINEERING DECISION left to you:
+// 0 = P-01 OFF in Case 2 (matches the current simulation), 1 = all three ON (matches the PDF text).
+#define CASE2_P01_DEFAULT  0
+
+// ---------------------------------------------------------------- PCB pins (do not change)
+#define PIN_SW      34   // manual ON/OFF switch, active LOW, external 10k pull-up
+#define PIN_FSW     35   // sump float switch, active LOW, external 10k pull-up
+#define PIN_FS      14   // FT-01 pulse input
+#define PIN_SV      27   // SOV-01 driver, HIGH = open
+const uint8_t PIN_LPWM[3] = {32, 18, 23};
+const uint8_t PIN_RPWM[3] = {33, 19, 25};
+const uint8_t PIN_LEN[3]  = {13, 16, 21};
+const uint8_t PIN_REN[3]  = {26, 17, 22};
+
+///These constants define the operating settings and safety thresholds.
+
+// ---------------------------------------------------------------- tuning
+#define PWM_FREQ            20000
+#define PWM_BITS            8
+#define DUTY_P01_PCT        50      // Case 1: pump-01 50 %
+#define DUTY_P02_PCT        100     // Case 1: pump-02 100 %
+#define DUTY_P03_PCT        100     // Case 2: pump-03 100 %
+#define SUMP_CLEAR_MS       2000    // float must stay clear this long before P-01 resumes
+#define SUMP_HIGH_MAX_MS    30000   // sump high for longer than this = alarm and stop
+#define NO_FLOW_MS          5000    // pump commanded, flow ~0 for this long = alarm
+#define NO_FLOW_LPM         0.15f
+#define BALL_VALVE_WAIT_S   15      // Case 2: time given to open the manual ball valve
+#define FLUSH_EXHAUST_LPM   0.30f   // flow below this ...
+#define FLUSH_EXHAUST_MS    3000    // ... for this long = flush tank empty
+#define FLUSH_MAX_LITRES    6.5f    // backstop only: 4.2 to 4.5 L tank + residual in sump and tubing. Exhaustion is normally detected by low flow first.
+#define FLUSH_MAX_MS        180000  // absolute flush time limit
+#define SEQ_CASE1_DEFAULT_S 60      // full sequence: Case 1 runs this long, then Case 2
+
+// ---------------------------------------------------------------- state
+enum State : uint8_t {
+  S_IDLE, S_C1_RUN, S_C1_SUMP_HOLD,
+  S_C2_ISOLATE, S_C2_WAIT_BALL, S_C2_FLUSH, S_C2_STOPPING, S_DONE,
+  S_MANUAL, S_ESTOP, S_FAULT
+};
+const char* STATE_NAME[] = {"IDLE", "CASE1_RUN", "CASE1_SUMP_HOLD",
+  "CASE2_ISOLATE", "CASE2_WAIT_BALL_VALVE", "CASE2_FLUSH", "CASE2_STOPPING", "DONE",
+  "MANUAL", "ESTOP", "FAULT"};
+
+State    st = S_IDLE;
+uint32_t stSince = 0;
+int      caseNo = 0;            // 0 none, 1, 2
+bool     seqMode = false;       // true = Case 1 then Case 2 automatically
+uint32_t seqCase1Ms = SEQ_CASE1_DEFAULT_S * 1000UL;
+bool     case2P01 = CASE2_P01_DEFAULT;
+
+///This is the main part in our code where A state machine divides the operation into named stages. 
+
+uint8_t  duty[3] = {0, 0, 0};   // commanded duty %, per pump
+bool     sov = false;
+bool     hmiRun = false, swIgnore = false;
+bool     manualMode = false;
+
+// alarms (bitmask)
+#define AL_ESTOP     0x01
+#define AL_SUMP_TMO  0x02
+#define AL_NO_FLOW   0x04
+#define AL_FLUSH_VOL 0x08
+#define AL_FLUSH_TMO 0x10
+#define AL_NOT_CAL   0x20
+uint8_t alarms = 0;
+
+///Instead of executing every action at once, the ESP32 knows which stage it is currently in and what conditions 
+///allow it to move to the next stage.
+
+
+// flow
+volatile uint32_t pulseCount = 0;
+void IRAM_ATTR onPulse() { pulseCount++; }
+uint32_t lastPulses = 0, lastFlowMs = 0;
+float    hz = 0, qLpm = 0, totalL = 0, caseL = 0;
+float    calA = 0.010204f, calB = 0.0f;   // YF-S401 datasheet nominal. NOT a calibration.
+bool     calibrated = false;
+bool     trialOn = false; uint32_t trialP0 = 0, trialT0 = 0;
+
+// input debounce
+bool swOn = false, fswHigh = false;
+uint32_t fswClearSince = 0, fswHighSince = 0, lowFlowSince = 0, exhaustSince = 0;
+
+Preferences prefs;
+WebServer   web(80);
+uint32_t lastReport = 0;
+String   lastEvent = "";
+
+// ---------------------------------------------------------------- pump / valve drivers
+void pwmAttach(int ch, uint8_t pin) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(pin, PWM_FREQ, PWM_BITS);
+#else
+  ledcSetup(ch, PWM_FREQ, PWM_BITS); ledcAttachPin(pin, ch);
+#endif
+}
+void pwmWrite(int ch, uint8_t pin, uint32_t v) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, v);
+#else
+  ledcWrite(ch, v);
+#endif
+}
+
+
+///The applyOutputs() function sends the requested commands to the hardware.
+
+void applyOutputs() {
+  for (int i = 0; i < 3; i++) {
+    uint32_t v = (uint32_t)duty[i] * 255UL / 100UL; 
+    
+///First,theESP32 initializes the input and output pins,connects to Wi-Fi,and configures the pumpdrivers.
+    
+    bool on = duty[i] > 0;
+    digitalWrite(PIN_REN[i], on ? HIGH : LOW);     // BTS7960 enables
+    digitalWrite(PIN_LEN[i], on ? HIGH : LOW);
+    digitalWrite(PIN_RPWM[i], LOW);                // one direction only
+    pwmWrite(i, PIN_LPWM[i], on ? v : 0);
+  }
+  digitalWrite(PIN_SV, sov ? HIGH : LOW);
+}
+
+void allOff() { duty[0] = duty[1] = duty[2] = 0; sov = false; applyOutputs(); }
+
+void setState(State s) {
+  st = s; stSince = millis();
+  lastEvent = String("state:") + STATE_NAME[s];
+}
+
+// ---------------------------------------------------------------- flow measurement
+void updateFlow() {
+  uint32_t now = millis();
+  if (now - lastFlowMs < 500) return;
+  noInterrupts(); uint32_t p = pulseCount; interrupts();
+  float dt = (now - lastFlowMs) / 1000.0f;
+  float f = (p - lastPulses) / dt;
+  hz = 0.5f * hz + 0.5f * f;                       // light smoothing
+  if (f == 0) hz = 0;
+  qLpm = (hz < 0.5f) ? 0 : calA * hz + calB; if (qLpm < 0) qLpm = 0;   // no pulses = no flow, whatever b is
+  float dl = qLpm * dt / 60.0f;
+  bool flushing = (st >= S_C2_ISOLATE && st <= S_C2_STOPPING);
+  if (!flushing) totalL += dl;        // total = volume returned to TK-01 (Case 1 and manual)
+  caseL += dl;
+  lastPulses = p; lastFlowMs = now;
+}
+
+// ---------------------------------------------------------------- inputs
+void readInputs() {
+  swOn = (digitalRead(PIN_SW) == LOW);
+
+///First, the ESP32 initializes the input and output pins, connects to Wi-Fi, and configures the pump drivers.
+
+  if (!swOn) swIgnore = false;
+  bool raw = (digitalRead(PIN_FSW) == LOW);        // LOW = sump HIGH (verify polarity on bench)
+  uint32_t now = millis();
+  if (raw) { fswClearSince = 0; if (!fswHigh) fswHighSince = now; fswHigh = true; }
+  else { if (fswHigh && fswClearSince == 0) fswClearSince = now;
+         if (fswHigh && now - fswClearSince >= SUMP_CLEAR_MS) fswHigh = false; }
+}
+
+// ---------------------------------------------------------------- state machine
+void startCase1(bool seq) {
+  if (alarms & AL_ESTOP) return;
+  alarms &= ~(AL_SUMP_TMO | AL_NO_FLOW | AL_FLUSH_VOL | AL_FLUSH_TMO);
+  manualMode = false; seqMode = seq; caseNo = 1; caseL = 0; lowFlowSince = 0;
+  setState(S_C1_RUN);
+}
+void startCase2() {
+  if (alarms & AL_ESTOP) return;
+  alarms &= ~(AL_SUMP_TMO | AL_NO_FLOW | AL_FLUSH_VOL | AL_FLUSH_TMO);
+  manualMode = false; caseNo = 2; caseL = 0; exhaustSince = 0; lowFlowSince = 0;
+  setState(S_C2_ISOLATE);
+}
+void stopAll() { hmiRun = false; if (swOn) swIgnore = true; seqMode = false; caseNo = 0; allOff(); setState(S_IDLE); }
+void estop() { alarms |= AL_ESTOP; hmiRun = false; seqMode = false; caseNo = 0; allOff(); setState(S_ESTOP); }
+
+void runStateMachine() {
+  uint32_t now = millis(), t = now - stSince;
+    
+///Case 1 is the normal operation. P-01 runs at 50% PWM and P-02 runs at 100%, while the solenoid valve is open. 
+
+  bool wantRun = (swOn && !swIgnore) || hmiRun;
+
+  // switch ON from idle starts Case 1
+  if (st == S_IDLE && wantRun && !manualMode) startCase1(false);
+
+  switch (st) {
+    case S_C1_RUN:
+      sov = true; duty[0] = DUTY_P01_PCT; duty[1] = DUTY_P02_PCT; duty[2] = 0;
+      if (fswHigh) { setState(S_C1_SUMP_HOLD); break; }
+      if (!wantRun && !seqMode) { stopAll(); break; }
+      if (seqMode && t >= seqCase1Ms) { startCase2(); break; }
+      break;  
+
+///The controller monitors the sump level and flow rate. If the sump level becomes high,
+ P-01 stops temporarily while P-02 continues running.
+
+    case S_C1_SUMP_HOLD:                         // sump high: P-01 OFF, P-02 keeps running
+      sov = true; duty[0] = 0; duty[1] = DUTY_P02_PCT; duty[2] = 0;
+      if (!fswHigh) { setState(S_C1_RUN); break; }
+      if (now - fswHighSince > SUMP_HIGH_MAX_MS) { alarms |= AL_SUMP_TMO; allOff(); setState(S_FAULT); break; }
+      if (!wantRun && !seqMode) { stopAll(); break; }
+      break;
+
+    case S_C2_ISOLATE:                           // SOV-01 closes to isolate the 10 L tank
+      sov = false; duty[0] = duty[1] = duty[2] = 0;
+      if (t >= 1000) setState(S_C2_WAIT_BALL);
+      break;
+
+/// Case 2 is the flushing operation. The controller first stops the pumps and closes the solenoid valve. 
+     
+      case S_C2_WAIT_BALL:                         // operator opens the manual ball valve now
+      sov = false; duty[0] = duty[1] = duty[2] = 0;
+      if (t >= BALL_VALVE_WAIT_S * 1000UL) { caseL = 0; exhaustSince = 0; setState(S_C2_FLUSH); }
+      break;
+
+    case S_C2_FLUSH:
+      sov = false;
+      duty[0] = case2P01 ? DUTY_P01_PCT : 0;
+      duty[1] = DUTY_P02_PCT; duty[2] = DUTY_P03_PCT;
+      if (t > 4000) {                            // let flow establish first
+        if (qLpm < FLUSH_EXHAUST_LPM) { if (!exhaustSince) exhaustSince = now; }
+        else exhaustSince = 0;
+        if (exhaustSince && now - exhaustSince >= FLUSH_EXHAUST_MS) { setState(S_C2_STOPPING); break; }
+      }
+      if (caseL >= FLUSH_MAX_LITRES) { alarms |= AL_FLUSH_VOL; setState(S_C2_STOPPING); break; }
+      if (t >= FLUSH_MAX_MS) { alarms |= AL_FLUSH_TMO; setState(S_C2_STOPPING); break; }
+      break;
+
+/// It then waits for the operator to open the manual ball valve. After the waiting period, the flushing process starts. 
+
+      case S_C2_STOPPING:                          // stop pump-03 first, then the rest
+      duty[2] = 0; sov = false;
+      if (t >= 500) duty[1] = 0;
+      if (t >= 1000) { duty[0] = 0; setState(S_DONE); caseNo = 0; seqMode = false; hmiRun = false; }
+      break;
+
+    case S_DONE: duty[0] = duty[1] = duty[2] = 0; sov = false; break;
+    case S_MANUAL: break;                        // outputs come from handleCommand
+    case S_ESTOP: duty[0] = duty[1] = duty[2] = 0; sov = false; break;
+    case S_FAULT: duty[0] = duty[1] = duty[2] = 0; sov = false; break;
+    default: break;
+  }
+
+  // no-flow supervision (Case 1 only; Case 2 flow path is not defined by the challenge)
+  bool pumpingC1 = (st == S_C1_RUN || st == S_C1_SUMP_HOLD) && duty[1] > 0;
+  if (pumpingC1 && t > 3000 && qLpm < NO_FLOW_LPM) {
+    if (!lowFlowSince) lowFlowSince = now;
+    if (now - lowFlowSince > NO_FLOW_MS) { alarms |= AL_NO_FLOW; allOff(); setState(S_FAULT); }
+  } else lowFlowSince = 0;
+
+///The system monitors the flow rate, estimated volume, and time, then stops the pumps in sequence.
+
+
+  // Interlocks: never run P-01 into a closed SOV-01 outside Case 2
+  if (!sov && st != S_C2_FLUSH && st != S_MANUAL) duty[0] = 0;
+  if (st == S_MANUAL && !sov) duty[0] = 0;
+  if (alarms & AL_ESTOP) { duty[0] = duty[1] = duty[2] = 0; sov = false; }
+
+  if (!calibrated) alarms |= AL_NOT_CAL; else alarms &= ~AL_NOT_CAL;
+  applyOutputs();
+}
+
+// ---------------------------------------------------------------- commands
+// Text commands, one per line (serial) or ?c= (HTTP):
+//   case1 | case2 | seq | stop | estop | reset
+//   p1=<0-100> p2=<..> p3=<..>   (manual mode only, enters MANUAL)
+//   sov=0|1    manual=0|1    case2p01=0|1    seqtime=<seconds>
+//   cal=<a>,<b>   trial=start|stop   tare   bvok (operator confirms ball valve open)
+String handleCommand(String c) {
+  c.trim(); c.toLowerCase();
+  if (c == "case1") { startCase1(false); hmiRun = true; return "ok"; }
+  if (c == "case2") { startCase2(); return "ok"; }
+  if (c == "seq")   { startCase1(true);  return "ok"; }
+  if (c == "stop")  { stopAll(); return "ok"; }
+  if (c == "estop") { estop(); return "ok"; }
+  if (c == "reset") { alarms &= (AL_NOT_CAL); hmiRun = false; if (swOn) swIgnore = true; allOff(); caseNo = 0; setState(S_IDLE); return "ok"; }
+  if (c == "tare")  { totalL = 0; caseL = 0; return "ok"; }
+  if (c == "bvok")  { if (st != S_C2_WAIT_BALL) return "refused:not_waiting"; caseL = 0; exhaustSince = 0; setState(S_C2_FLUSH); return "ok"; }
+  if (c.startsWith("manual=")) {
+    if (alarms & AL_ESTOP) return "refused:estop";
+    if (c.endsWith("1")) { allOff(); caseNo = 0; seqMode = false; manualMode = true; setState(S_MANUAL); }
+    else { manualMode = false; allOff(); setState(S_IDLE); }
+    return "ok";
+  }
+  if (c.startsWith("p1=") || c.startsWith("p2=") || c.startsWith("p3=")) {
+    if (!manualMode) return "refused:not_manual";
+    int i = c.charAt(1) - '1'; int v = constrain(c.substring(3).toInt(), 0, 100);
+    if (i == 0 && !sov && v > 0) return "refused:sov_closed";
+    duty[i] = v; return "ok";
+  }
+  if (c.startsWith("sov=")) {
+    if (!manualMode) return "refused:not_manual";
+    sov = c.endsWith("1"); if (!sov) duty[0] = 0; return "ok";
+  }
+
+///We also implemented safety features such as emergency stop, low-flow detection, sump-level timeout, and flushing limits.
+
+
+  if (c.startsWith("case2p01=")) { case2P01 = c.endsWith("1"); return "ok"; }
+  if (c.startsWith("seqtime=")) { seqCase1Ms = constrain(c.substring(8).toInt(), 10, 3600) * 1000UL; return "ok"; }
+  if (c.startsWith("cal=")) {
+    int k = c.indexOf(',');
+    if (k < 0) return "refused:format";
+    float na = c.substring(4, k).toFloat(), nb = c.substring(k + 1).toFloat();
+    if (!(na > 0) || !isfinite(nb)) return "refused:bad_cal";
+    calA = na; calB = nb;
+    calibrated = true;
+    prefs.putFloat("a", calA); prefs.putFloat("b", calB); prefs.putBool("ok", true);
+    return "ok";
+  }
+  if (c == "trial=start") { noInterrupts(); trialP0 = pulseCount; interrupts(); trialT0 = millis(); trialOn = true; return "ok"; }
+  if (c == "trial=stop" && trialOn) {
+    noInterrupts(); uint32_t p = pulseCount; interrupts();
+    trialOn = false;
+    lastEvent = "trial:" + String(p - trialP0) + "," + String((millis() - trialT0) / 1000.0f, 2);
+    return lastEvent;
+  }
+  return "refused:unknown";
+}
+
+
+///Finally, the ESP32 communicates with the SCADA dashboard through Wi-Fi
+
+// ---------------------------------------------------------------- reporting
+String statusJson() {
+  String s; s.reserve(480);
+  s += "{\"t\":" + String(millis());
+  s += ",\"state\":\"" + String(STATE_NAME[st]) + "\"";
+  s += ",\"case\":" + String(caseNo);
+  s += ",\"seq\":" + String(seqMode ? 1 : 0);
+  s += ",\"duty\":[" + String(duty[0]) + "," + String(duty[1]) + "," + String(duty[2]) + "]";
+  s += ",\"sov\":" + String(sov ? 1 : 0);
+  s += ",\"fsw\":" + String(fswHigh ? 1 : 0);
+  s += ",\"sw\":" + String(swOn ? 1 : 0);
+  s += ",\"hz\":" + String(hz, 2);
+  s += ",\"q\":" + String(qLpm, 3);
+  s += ",\"tot\":" + String(totalL, 3);
+  s += ",\"caseL\":" + String(caseL, 3);
+  s += ",\"pulses\":" + String(pulseCount);
+  s += ",\"alm\":" + String(alarms);
+  s += ",\"a\":" + String(calA, 6) + ",\"b\":" + String(calB, 4) + ",\"cal\":" + String(calibrated ? 1 : 0);
+  s += ",\"c2p01\":" + String(case2P01 ? 1 : 0);
+  s += ",\"wait\":" + String(st == S_C2_WAIT_BALL ? (int)(BALL_VALVE_WAIT_S - (millis() - stSince) / 1000) : 0);
+  s += ",\"ev\":\"" + lastEvent + "\"}";
+  lastEvent = "";
+  return s;
+}
+
+
+///This allows the operator to monitor the system status and send commands.
+
+void sendCors() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.sendHeader("Cache-Control", "no-store");
+}
+void setupWeb() {
+  web.on("/api/status", []() { sendCors(); web.send(200, "application/json", statusJson()); });
+  web.on("/api/cmd", []() {
+    sendCors(); web.send(200, "text/plain", handleCommand(web.arg("c")));
+  });
+  web.onNotFound([]() { sendCors(); web.send(404, "text/plain", "LAM Stage 2 ESP32 - use /api/status"); });
+  web.begin();
+}
+
+// ---------------------------------------------------------------- setup / loop
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_SW, INPUT);            // GPIO34/35 are input-only; PCB has the pull-ups
+  pinMode(PIN_FSW, INPUT);
+  pinMode(PIN_FS, INPUT_PULLUP);     // helps an open-collector sensor; still measure the level first
+  pinMode(PIN_SV, OUTPUT); digitalWrite(PIN_SV, LOW);
+  for (int i = 0; i < 3; i++) {
+    pinMode(PIN_LEN[i], OUTPUT); pinMode(PIN_REN[i], OUTPUT); pinMode(PIN_RPWM[i], OUTPUT);
+    digitalWrite(PIN_LEN[i], LOW); digitalWrite(PIN_REN[i], LOW); digitalWrite(PIN_RPWM[i], LOW);
+    pwmAttach(i, PIN_LPWM[i]); pwmWrite(i, PIN_LPWM[i], 0);
+  }
+  attachInterrupt(digitalPinToInterrupt(PIN_FS), onPulse, RISING);
+
+  prefs.begin("lamcal", false);
+  calibrated = prefs.getBool("ok", false);
+  if (calibrated) { calA = prefs.getFloat("a", calA); calB = prefs.getFloat("b", calB); }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
+  if (strlen(WIFI_STA_SSID)) WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+  setupWeb();
+  lastFlowMs = millis();
+  setState(S_IDLE);
+  Serial.println("{\"ev\":\"boot\",\"fw\":\"lam_stage2 1.0\"}");
+}
+
+
+///Overall, our code provides automated pump control, process monitoring, safety checks, and communication with the SCADA interface.
+
+void loop() {
+  web.handleClient();
+  readInputs();
+  updateFlow();
+  runStateMachine();
+
+  while (Serial.available()) {                   // one command per line
+    static String buf;
+    char ch = Serial.read();
+    if (ch == '\n' || ch == '\r') { if (buf.length()) { String r = handleCommand(buf); Serial.println("{\"ack\":\"" + r + "\"}"); buf = ""; } }
+    else if (buf.length() < 64) buf += ch;
+  }
+
+  if (millis() - lastReport >= 200) { lastReport = millis(); Serial.println(statusJson()); }
+}
